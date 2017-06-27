@@ -182,6 +182,8 @@ save_playlist (const char *path, struct fuse_file_info *fi)
   gchar **fields;
   GSList *tmplist = NULL;
 
+  // Null terminator.
+  item_path[sizeof(item_path) - 1] = 0;
   fields = g_strsplit (path, "/", -1);
   gchar *playlist_name;
   playlist_name = g_strndup (fields[2], strlen (fields[2]) - 4);
@@ -190,8 +192,19 @@ save_playlist (const char *path, struct fuse_file_info *fi)
 
   playlist = LIBMTP_new_playlist_t ();
   playlist->name = g_strdup (playlist_name);
+  if (playlist->name == 0)
+    {
+      perror("g_strdup");
+      return -1;
+    }
 
   file = fdopen (fi->fh, "r");
+  if (file == 0)
+    {
+      DBG("file could not be opened: %lu %s", fi->fh, playlist_name);
+      LIBMTP_destroy_playlist_t (playlist);
+      return -1;
+    }
   while (fgets (item_path, sizeof (item_path) - 1, file) != NULL)
     {
       g_strchomp (item_path);
@@ -200,10 +213,36 @@ save_playlist (const char *path, struct fuse_file_info *fi)
 	{
 	  tmplist = g_slist_append (tmplist, GUINT_TO_POINTER (item_id));
 	  DBG ("Adding to tmplist:%d", item_id);
+	  // Null deref fix
+	  if (tmplist == 0)
+	    {
+	      DBG ("g_slist_append failed");
+	      LIBMTP_destroy_playlist_t (playlist);
+	      return -1;
+	    }
 	}
     }
+  // Don't allow empty playlist.
+  if (tmplist == 0)
+    {
+      DBG ("No items in tmplist: %p", tmplist);
+      LIBMTP_destroy_playlist_t (playlist);
+      return -1;
+    }
   playlist->no_tracks = g_slist_length (tmplist);
+  // Integer overflow protection
+  if (playlist->no_tracks > UINT_MAX / sizeof(uint32_t))
+    {
+      DBG ("playlist too large: %d", playlist->no_tracks);
+      LIBMTP_destroy_playlist_t (playlist);
+      return -1;
+    }
   tracks = g_malloc (playlist->no_tracks * sizeof (uint32_t));
+  if (tracks == 0)
+    {
+      perror("g_malloc");
+      return -1;
+    }
   int i;
   for (i = 0; i < playlist->no_tracks; i++)
     {
@@ -250,6 +289,11 @@ find_filetype (const gchar * filename)
   fields = g_strsplit (filename, ".", -1);
   gchar *ptype;
   ptype = g_strdup (fields[g_strv_length (fields) - 1]);
+  if (ptype == 0)
+    {
+      perror("g_strdup");
+      return -1;
+    }
   g_strfreev (fields);
   LIBMTP_filetype_t filetype;
 
@@ -554,7 +598,15 @@ parse_path (const gchar * path)
   LIBMTP_folder_t *folder;
   gchar **fields;
   gchar *directory;
-  directory = (gchar *) g_malloc (strlen (path) + 1);
+  // It's impossible for directory_len to integer overflow, so this is acceptable.
+  size_t directory_len = strlen (path) + 1;
+  directory = (gchar *) g_malloc (directory_len);
+  // validate malloc
+  if (directory == 0)
+    {
+      perror("g_malloc");
+      return -1;
+    }
   directory = strcpy (directory, "");
   fields = g_strsplit (path, "/", -1);
   res = -ENOENT;
@@ -570,8 +622,8 @@ parse_path (const gchar * path)
 	{
 	  if (fields[i + 1] != NULL)
 	    {
-	      directory = strcat (directory, "/");
-	      directory = strcat (directory, fields[i]);
+	      directory = strncat (directory, "/", directory_len);
+	      directory = strncat (directory, fields[i], directory_len);
 	    }
 	  else
 	    {
@@ -610,8 +662,8 @@ parse_path (const gchar * path)
 		}
 	      if (item_id < 0)
 		{
-		  directory = strcat (directory, "/");
-		  directory = strcat (directory, fields[i]);
+		  directory = strncat (directory, "/", directory_len);
+		  directory = strncat (directory, fields[i], directory_len);
 		  item_id = lookup_folder_id (folder, directory, NULL);
 		  res = item_id;
 		  break;
@@ -650,9 +702,20 @@ mtpfs_release (const char *path, struct fuse_file_info *fi)
 	{
 	  //find parent id
 	  gchar *filename = g_strdup ("");
+	  if (filename == 0)
+	    {
+	      perror("g_strdup");
+	      return_unlock(-1);
+	    }
 	  gchar **fields;
 	  gchar *directory;
-	  directory = (gchar *) g_malloc (strlen (path) + 1);
+	  size_t directory_len = strlen (path) + 1;
+	  directory = (gchar *) g_malloc (directory_len);
+	  if (directory == 0)
+	    {
+	      perror("g_malloc");
+	      return_unlock(-1);
+	    }
 	  directory = strcpy (directory, "/");
 	  fields = g_strsplit (path, "/", -1);
 	  int i;
@@ -679,11 +742,16 @@ mtpfs_release (const char *path, struct fuse_file_info *fi)
 			parent_id = 0;
 		      g_free (filename);
 		      filename = g_strdup (fields[i]);
+		      if (filename == 0)
+			{
+			  perror("g_strdup");
+			  return -1;
+			}
 		    }
 		  else
 		    {
-		      directory = strcat (directory, fields[i]);
-		      directory = strcat (directory, "/");
+		      directory = strncat (directory, fields[i], directory_len);
+		      directory = strncat (directory, "/", directory_len);
 		    }
 		}
 	    }
@@ -1180,7 +1248,13 @@ mtpfs_mknod (const gchar * path, mode_t mode, dev_t dev)
   int item_id = parse_path (path);
   if (item_id > 0)
     return_unlock (-EEXIST);
-  myfiles = g_slist_append (myfiles, (gpointer) (g_strdup (path)));
+  char *pathtmp = g_strdup (path);
+  if (pathtmp == 0)
+    {
+      perror("g_strdup");
+      return_unlock(-1);
+    }
+  myfiles = g_slist_append (myfiles, (gpointer) (pathtmp));
   DBG ("NEW FILE");
   return_unlock (0);
 }
@@ -1216,6 +1290,11 @@ mtpfs_open (const gchar * path, struct fuse_file_info *fi)
       return_unlock (-ENOENT);
     }
   FILE *filetmp = tmpfile ();
+  if (filetmp == 0)
+    {
+      perror("tmpfile");
+      return_unlock(-ENOENT);
+    }
   int tmpfile = fileno (filetmp);
   if (tmpfile != -1)
     {
@@ -1251,6 +1330,11 @@ mtpfs_open (const gchar * path, struct fuse_file_info *fi)
 			{
 			  gchar *path;
 			  path = (gchar *) g_malloc (1024);
+			  if (path == 0)
+			    {
+			      perror("g_malloc");
+			      return -1;
+			    }
 			  path = strcpy (path, "/");
 			  int parent_id = file->parent_id;
 			  while (parent_id != 0)
@@ -1259,11 +1343,21 @@ mtpfs_open (const gchar * path, struct fuse_file_info *fi)
 			      folder =
 				LIBMTP_Find_Folder
 				(storageArea[storageid].folders, parent_id);
-			      path = strcat (path, folder->name);
-			      path = strcat (path, "/");
+			      if (strlen(path) + strlen(folder->name) >= 1024)
+			        {
+				  DBG("playlist path filename overflow");
+				  break;
+			        }
+			      path = strncat (path, folder->name, 1023);
+			      path = strncat (path, "/", 1024);
 			      parent_id = folder->parent_id;
 			    }
-			  path = strcat (path, file->filename);
+			  if (strlen(path) + strlen(file->filename) >= 1024)
+			    {
+			      DBG("playlist path filename overflow");
+			      continue;
+			    }
+			  path = strncat (path, file->filename, 1023);
 			  fprintf (filetmp, "%s\n", path);
 			  DBG ("%s\n", path);
 			}
@@ -1378,10 +1472,21 @@ mtpfs_mkdir_real (const char *path, mode_t mode)
     {
       // Split path and find parent_id
       gchar *filename = g_strdup ("");
+      if (filename == 0)
+	{
+	  perror("g_strdup");
+	  return -1;
+	}
       gchar **fields;
       gchar *directory;
 
-      directory = (gchar *) g_malloc (strlen (path) + 1);
+      size_t directory_len = strlen (path) + 1;
+      directory = (gchar *) g_malloc (directory_len);
+      if (directory == 0)
+        {
+	  perror("g_malloc");
+	  return -1;
+	}
       directory = strcpy (directory, "/");
       fields = g_strsplit (path, "/", -1);
       int i;
@@ -1403,11 +1508,16 @@ mtpfs_mkdir_real (const char *path, mode_t mode)
 		    parent_id = 0;
 		  g_free (filename);
 		  filename = g_strdup (fields[i]);
+		  if (filename == 0)
+		    {
+		      perror("g_strdup");
+		      return -1;
+		    }
 		}
 	      else
 		{
-		  directory = strcat (directory, fields[i]);
-		  directory = strcat (directory, "/");
+		  directory = strncat (directory, fields[i], directory_len);
+		  directory = strncat (directory, "/", directory_len);
 		}
 	    }
 	}

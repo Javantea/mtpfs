@@ -258,6 +258,7 @@ getTracknum (struct id3_tag * tag)
       return NULL;
     }
   trackno[0] = '\0';
+  trackno[sizeof (trackno) - 1] = '\0';
   // Take care of any a/b formats
   for (i = 0; i < strlen (trackstr); i++)
     {
@@ -286,7 +287,7 @@ getTracknum (struct id3_tag * tag)
 	{
 	  strcat (trackno, "0");
 	}
-      strncat (trackno, trackstr, sizeof (trackno) - strlen (trackno) - 1);
+      strncat (trackno, trackstr, sizeof (trackno) - 1);
       g_free (trackstr);
       g_free (posstr);
     }
